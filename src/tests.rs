@@ -113,23 +113,26 @@ fn user_gets_the_higher_margin_prediction_for_overlapping_windows() {
 }
 
 // Session::scan requires pinned model assets to reach this scenario; this direct
-// stitch-level test checks which prediction a user receives when overlapping windows have
-// equal margins.
+// stitch-level test checks which prediction a user receives from reachable windows.
 #[test]
-fn user_keeps_the_earlier_prediction_when_window_margins_tie() {
-    // Given overlapping windows with equal margins at the handoff,
-    // when their predictions are stitched,
+fn user_keeps_the_earlier_prediction_near_the_window_margin_crossover() {
+    // Given windows produced by the planner and predictions that disagree,
+    // when token 445 is stitched with margins 64 and 63,
     // then the earlier window's prediction is returned.
+    let ranges = scan::windows(640);
+    assert_eq!(ranges, [0..510, 382..640]);
     let selected = scan::stitch(
-        7,
-        &[0..5, 2..7],
+        640,
+        &ranges,
         &[
-            Arc::from(vec![prediction(1, 0.25); 5]),
-            Arc::from(vec![prediction(3, 0.75); 5]),
+            Arc::from(vec![prediction(1, 0.25); 510]),
+            Arc::from(vec![prediction(3, 0.75); 258]),
         ],
     );
-    let actual: Vec<_> = selected.iter().map(|p| (p.tag, p.probability)).collect();
-    // At token 3 both windows have margin 1; the earlier window wins.
+    let actual: Vec<_> = selected[442..449]
+        .iter()
+        .map(|p| (p.tag, p.probability))
+        .collect();
     assert_eq!(
         actual,
         [
