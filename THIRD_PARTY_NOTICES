@@ -54,8 +54,9 @@ SUCH DAMAGE.
 Source of record: oniguruma/COPYING in the onig_sys 69.9.3 crate
 (https://crates.io/crates/onig_sys/69.9.3). The Oniguruma source is compiled
 into the shipped binary; the onig_sys crate itself is MIT-licensed.
-The complete Oniguruma NOTICE/HISTORY files are not redistributed with the
-crate and still need to be added once obtained upstream.
+The onig_sys 69.9.3 source crate includes oniguruma/HISTORY; this notice does not
+reproduce it. Binary distributions must include the complete applicable
+Oniguruma notice and HISTORY materials.
 
 Direct Cargo dependencies and their licenses: libm 0.2.16 (MIT), prost 0.14.4
 (Apache-2.0), rayon 1.12.0 (MIT OR Apache-2.0), serde 1.0.229
