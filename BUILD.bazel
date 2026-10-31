@@ -1,0 +1,50 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml", "Cargo.lock"])
+
+# Preserve Cargo package metadata, including Clippy's minimum Rust version.
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+)
+
+_RUST_FLAGS = [
+    "--forbid=unsafe_code",
+    "--warn=missing_docs",
+]
+
+rust_library(
+    name = "astrlink",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = ["model.json"],
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env_files = [":cargo_env"],
+    rustc_flags = _RUST_FLAGS,
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+# Unit and opt-in model tests share this single compiled test carrier.
+rust_test(
+    name = "astrlink_test",
+    size = "medium",
+    crate = ":astrlink",
+    compile_data = ["testdata/oracle.json"],
+    env_inherit = ["ASTRLINK_MODEL_DIR"],
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env_files = [":cargo_env"],
+    rustc_flags = _RUST_FLAGS,
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_clippy_test(
+    name = "clippy",
+    targets = [
+        ":astrlink",
+        ":astrlink_test",
+    ],
+)
