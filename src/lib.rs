@@ -44,9 +44,12 @@ impl Cancellation {
 /// Resource limits shared by all sessions of a model.
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// Number of compute threads. Must be between 1 and 64.
+    /// Number of compute threads, from 1 through 64 inclusive.
+    /// [`Model::load`] returns [`Error::Configuration`] outside this range.
     pub workers: usize,
-    /// Maximum simultaneous scans. Excess scans return [`Error::Busy`].
+    /// Maximum simultaneous scans, from 1 through 64 inclusive.
+    /// [`Model::load`] returns [`Error::Configuration`] outside this range.
+    /// Once this many scans are active, additional scans return [`Error::Busy`].
     pub max_in_flight: usize,
     /// Maximum UTF-8 input bytes per scan, checked before tokenization.
     pub max_bytes: usize,
@@ -101,10 +104,18 @@ impl Model {
         let assets = assets::load(directory)?;
         let net = net::Net::load(assets.tensors)?;
         let mut tokenizer =
-            tokenizers::Tokenizer::from_bytes(assets.tokenizer).map_err(|_| Error::Tokenizer)?;
+            tokenizers::Tokenizer::from_bytes(assets.tokenizer).map_err(|source| {
+                Error::Tokenizer {
+                    stage: "load",
+                    source: Some(source),
+                }
+            })?;
         tokenizer
             .with_truncation(None)
-            .map_err(|_| Error::Tokenizer)?;
+            .map_err(|source| Error::Tokenizer {
+                stage: "configure truncation",
+                source: Some(source),
+            })?;
         tokenizer.with_padding(None);
         // The shared tokenizer must not retain text across session owners.
         let mut tokenizer_model = tokenizer.get_model().clone();

@@ -23,7 +23,13 @@ pub enum Error {
     Model(String),
     /// The tokenizer could not load or encode input.
     #[error("tokenizer operation failed; verify the pinned tokenizer asset")]
-    Tokenizer,
+    Tokenizer {
+        /// Operation that failed: load, configure truncation, encode, or validate offsets.
+        stage: &'static str,
+        /// Original tokenizer cause, absent for local offset validation failures.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     /// A configuration value is outside the supported bounds.
     #[error("invalid configuration: {0}")]
     Configuration(&'static str),

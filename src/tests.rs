@@ -35,6 +35,380 @@ fn user_gets_complete_bounded_window_coverage() {
     }
 }
 
+#[test]
+fn user_gets_original_cause_in_tokenizer_error_chain() {
+    use std::error::Error as _;
+
+    // Given a tokenizer failure with an underlying I/O cause,
+    let error = Error::Tokenizer {
+        stage: "encode",
+        source: Some(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tokenizer test failure",
+        ))),
+    };
+    // When the caller inspects the returned error chain,
+    // then the stage and original I/O cause are available.
+    assert!(matches!(
+        &error,
+        Error::Tokenizer {
+            stage: "encode",
+            ..
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "tokenizer operation failed; verify the pinned tokenizer asset"
+    );
+    let source = error.source().unwrap();
+    assert_eq!(source.to_string(), "tokenizer test failure");
+    assert_eq!(
+        source.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    // Given a tokenizer failure with no underlying cause,
+    // when the caller inspects its error chain,
+    let error = Error::Tokenizer {
+        stage: "validate offsets",
+        source: None,
+    };
+    // then no source is reported.
+    assert!(error.source().is_none());
+}
+
+fn prediction(tag: usize, probability: f32) -> scan::Prediction {
+    scan::Prediction { tag, probability }
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct
+// stitch-level test checks which overlapping prediction the user receives when windows
+// disagree.
+#[test]
+fn user_gets_the_higher_margin_prediction_for_overlapping_windows() {
+    // Given overlapping windows that disagree,
+    // when their predictions are stitched,
+    // then the returned labels reflect the winning margin.
+    let selected = scan::stitch(
+        8,
+        &[0..6, 2..8],
+        &[
+            Arc::from(vec![prediction(1, 0.25); 6]),
+            Arc::from(vec![prediction(3, 0.75); 6]),
+        ],
+    );
+    let actual: Vec<_> = selected.iter().map(|p| (p.tag, p.probability)).collect();
+    assert_eq!(
+        actual,
+        [
+            (1, 0.25),
+            (1, 0.25),
+            (1, 0.25),
+            (1, 0.25),
+            (3, 0.75),
+            (3, 0.75),
+            (3, 0.75),
+            (3, 0.75),
+        ]
+    );
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct
+// stitch-level test checks which prediction a user receives from reachable windows.
+#[test]
+fn user_keeps_the_earlier_prediction_near_the_window_margin_crossover() {
+    // Given windows produced by the planner and predictions that disagree,
+    // when token 445 is stitched with margins 64 and 63,
+    // then the earlier window's prediction is returned.
+    let ranges = scan::windows(640);
+    assert_eq!(ranges, [0..510, 382..640]);
+    let selected = scan::stitch(
+        640,
+        &ranges,
+        &[
+            Arc::from(vec![prediction(1, 0.25); 510]),
+            Arc::from(vec![prediction(3, 0.75); 258]),
+        ],
+    );
+    let actual: Vec<_> = selected[442..449]
+        .iter()
+        .map(|p| (p.tag, p.probability))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (1, 0.25),
+            (1, 0.25),
+            (1, 0.25),
+            (1, 0.25),
+            (3, 0.75),
+            (3, 0.75),
+            (3, 0.75),
+        ]
+    );
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct
+// stitch-level test checks results for a user input whose final prediction window is
+// shorter than the preceding window.
+#[test]
+fn user_gets_predictions_from_a_short_final_window() {
+    // Given a shorter final window,
+    // when predictions are stitched,
+    // then returned labels cover the input using the final window's actual length.
+    let selected = scan::stitch(
+        8,
+        &[0..7, 4..8],
+        &[
+            Arc::from(vec![prediction(1, 0.25); 7]),
+            Arc::from(vec![prediction(3, 0.75); 4]),
+        ],
+    );
+    let actual: Vec<_> = selected.iter().map(|p| (p.tag, p.probability)).collect();
+    assert_eq!(
+        actual,
+        [
+            (1, 0.25),
+            (1, 0.25),
+            (1, 0.25),
+            (1, 0.25),
+            (1, 0.25),
+            (1, 0.25),
+            (3, 0.75),
+            (3, 0.75),
+        ]
+    );
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct stitch
+// and decode test checks that a user's email spanning the window handoff remains one
+// detected entity.
+#[test]
+fn user_gets_one_email_spanning_adjacent_prediction_windows() {
+    // Given overlapping predictions that split an email across the window handoff,
+    let mut first = vec![prediction(0, 1.0); 510];
+    let mut last = vec![prediction(0, 1.0); 134];
+    // Email starts before the overlap handoff at 446 and ends after token 510.
+    first[444] = prediction(1, 0.875);
+    first[445..].fill(prediction(2, 0.75));
+    // The second window disagrees at 444 and 445, but has the smaller margin.
+    last[62..64].fill(prediction(3, 1.0));
+    last[64..132].fill(prediction(2, 0.625));
+    // When the window predictions are stitched and decoded,
+    let selected = scan::stitch(516, &[0..510, 382..516], &[first.into(), last.into()]);
+    assert_eq!(selected.len(), 516);
+    let actual: Vec<_> = selected[443..447]
+        .iter()
+        .map(|p| (p.tag, p.probability))
+        .collect();
+    assert_eq!(actual, [(0, 1.0), (1, 0.875), (2, 0.75), (2, 0.625)]);
+    let actual: Vec<_> = selected[509..516]
+        .iter()
+        .map(|p| (p.tag, p.probability))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (2, 0.625),
+            (2, 0.625),
+            (2, 0.625),
+            (2, 0.625),
+            (2, 0.625),
+            (0, 1.0),
+            (0, 1.0)
+        ]
+    );
+    let offsets: Vec<_> = (0..516).map(|i| (i, i + 1)).collect();
+    // then the caller receives one email span crossing token 510.
+    assert_eq!(
+        scan::decode(&offsets, &selected, 0.5),
+        [Span {
+            bytes: 444..514,
+            category: Category::Email,
+            confidence: 0.625
+        }]
+    );
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct
+// decode-level test checks the user's result when a prediction sequence begins with an
+// inside tag.
+#[test]
+fn user_gets_an_email_from_an_isolated_inside_tag() {
+    // Given a single inside-tag prediction,
+    // when the prediction is decoded,
+    // then the user receives an email span for that token.
+    assert_eq!(
+        scan::decode(&[(2, 5)], &[prediction(2, 0.75)], 0.5),
+        [Span {
+            bytes: 2..5,
+            category: Category::Email,
+            confidence: 0.75
+        }]
+    );
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct
+// decode-level test checks separate results when a user's adjacent tokens both begin
+// entities.
+#[test]
+fn user_gets_separate_emails_for_consecutive_begin_tags() {
+    // Given adjacent begin-tag predictions,
+    // when the predictions are decoded,
+    // then the user receives two separate email spans.
+    assert_eq!(
+        scan::decode(
+            &[(0, 3), (3, 6)],
+            &[prediction(1, 0.75), prediction(1, 0.875)],
+            0.5
+        ),
+        [
+            Span {
+                bytes: 0..3,
+                category: Category::Email,
+                confidence: 0.75
+            },
+            Span {
+                bytes: 3..6,
+                category: Category::Email,
+                confidence: 0.875
+            },
+        ]
+    );
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct
+// decode-level test checks the user's returned spans when an inside-tag prediction
+// changes category.
+#[test]
+fn user_gets_a_new_entity_when_the_inside_tag_changes_category() {
+    // Given an inside tag whose category differs from the active entity,
+    // when the predictions are decoded,
+    // then the user receives separate entities for both categories.
+    assert_eq!(
+        scan::decode(
+            &[(0, 2), (2, 4), (4, 7)],
+            &[
+                prediction(1, 0.875),
+                prediction(4, 0.75),
+                prediction(4, 0.625)
+            ],
+            0.5,
+        ),
+        [
+            Span {
+                bytes: 0..2,
+                category: Category::Email,
+                confidence: 0.875
+            },
+            Span {
+                bytes: 2..7,
+                category: Category::Phone,
+                confidence: 0.625
+            },
+        ]
+    );
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct
+// decode-level test checks that a user's entity ends at an outside-tag prediction.
+#[test]
+fn user_gets_an_entity_ended_before_an_outside_tag() {
+    // Given an outside tag between entity predictions,
+    // when the predictions are decoded,
+    // then the user receives an entity that ends before the outside tag.
+    assert_eq!(
+        scan::decode(
+            &[(0, 2), (2, 4), (4, 6), (6, 8)],
+            &[
+                prediction(1, 0.875),
+                prediction(2, 0.75),
+                prediction(0, 0.125),
+                prediction(2, 0.625)
+            ],
+            0.5,
+        ),
+        [
+            Span {
+                bytes: 0..4,
+                category: Category::Email,
+                confidence: 0.75
+            },
+            Span {
+                bytes: 6..8,
+                category: Category::Email,
+                confidence: 0.625
+            },
+        ]
+    );
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct
+// decode-level test checks the user's result for tokenizer offsets that repeat or contain
+// no bytes.
+#[test]
+fn user_gets_one_entity_for_repeated_offsets_and_ignores_empty_offsets() {
+    // Given repeated and empty offsets for predicted tokens,
+    // when the predictions are decoded,
+    // then the user receives one entity spanning the nonempty offsets.
+    assert_eq!(
+        scan::decode(
+            &[(0, 3), (0, 3), (3, 3), (3, 6)],
+            &[
+                prediction(1, 0.875),
+                prediction(2, 0.625),
+                prediction(0, 0.125),
+                prediction(2, 0.75)
+            ],
+            0.5,
+        ),
+        [Span {
+            bytes: 0..6,
+            category: Category::Email,
+            confidence: 0.625
+        }]
+    );
+}
+
+// Session::scan requires pinned model assets to reach this scenario; this direct
+// decode-level test checks the user's confidence filtering result for an entity with a
+// weak middle token.
+#[test]
+fn user_gets_the_whole_entity_filtered_when_middle_confidence_is_low() {
+    // Given an entity with a low-confidence middle token and a separate strong entity,
+    // when the user raises the confidence threshold,
+    // then only the strong entity remains in the result.
+    let offsets = [(0, 2), (2, 4), (4, 6), (7, 9)];
+    let predictions = [
+        prediction(1, 0.875),
+        prediction(2, 0.25),
+        prediction(2, 0.75),
+        prediction(3, 0.875),
+    ];
+    assert_eq!(
+        scan::decode(&offsets, &predictions, 0.25),
+        [
+            Span {
+                bytes: 0..6,
+                category: Category::Email,
+                confidence: 0.25
+            },
+            Span {
+                bytes: 7..9,
+                category: Category::Phone,
+                confidence: 0.875
+            },
+        ]
+    );
+    assert_eq!(
+        scan::decode(&offsets, &predictions, 0.5),
+        [Span {
+            bytes: 7..9,
+            category: Category::Phone,
+            confidence: 0.875
+        }]
+    );
+}
+
 #[derive(serde::Deserialize)]
 struct Oracle {
     oracle: String,

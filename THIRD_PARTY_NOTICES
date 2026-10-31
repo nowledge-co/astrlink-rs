@@ -22,6 +22,48 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+Oniguruma — https://github.com/kkosako/oniguruma
+(vendored by onig_sys 69.9.3, a build dependency of tokenizers 0.23.2)
+
+BSD-2-Clause License
+
+Copyright (c) 2002-2021  K.Kosako
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+
+Source of record: oniguruma/COPYING in the onig_sys 69.9.3 crate
+(https://crates.io/crates/onig_sys/69.9.3). The Oniguruma source is compiled
+into the shipped binary; the onig_sys crate itself is MIT-licensed.
+The onig_sys 69.9.3 source crate includes oniguruma/HISTORY; this notice does not
+reproduce it. Binary distributions must include the complete applicable
+Oniguruma notice and HISTORY materials.
+
+Direct Cargo dependencies and their licenses: libm 0.2.16 (MIT), prost 0.14.4
+(Apache-2.0), rayon 1.12.0 (MIT OR Apache-2.0), serde 1.0.229
+(MIT OR Apache-2.0), serde_json 1.0.154 (MIT OR Apache-2.0), sha2 0.10.9
+(MIT OR Apache-2.0), thiserror 2.0.21 (MIT OR Apache-2.0), tokenizers 0.23.2
+(Apache-2.0).
+
 ONNX Runtime MLAS — https://github.com/microsoft/onnxruntime/tree/v1.23.2/onnxruntime/core/mlas
 
 MIT License

@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -48,6 +47,8 @@ pub fn load(dir: &Path) -> Result<Assets, Error> {
 }
 
 fn read_verified(dir: &Path, pin: &Pin) -> Result<Vec<u8>, Error> {
+    use std::io::Read;
+
     let path = dir.join(pin.file);
     let file = File::open(&path).map_err(|source| Error::Io {
         path: path.clone(),

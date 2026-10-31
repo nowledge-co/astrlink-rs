@@ -74,8 +74,8 @@ pub struct Scan {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Prediction {
-    tag: usize,
-    probability: f32,
+    pub(super) tag: usize,
+    pub(super) probability: f32,
 }
 
 type Predictions = Arc<[Prediction]>;
@@ -138,7 +138,10 @@ impl Session {
         let encoded = inner
             .tokenizer
             .encode(text, false)
-            .map_err(|_| Error::Tokenizer)?;
+            .map_err(|source| Error::Tokenizer {
+                stage: "encode",
+                source: Some(source),
+            })?;
         cancel.check()?;
         let ids = encoded.get_ids();
         if ids.len() > inner.options.max_tokens {
@@ -154,7 +157,10 @@ impl Session {
                 || !text.is_char_boundary(start)
                 || !text.is_char_boundary(end)
         }) {
-            return Err(Error::Tokenizer);
+            return Err(Error::Tokenizer {
+                stage: "validate offsets",
+                source: None,
+            });
         }
         let ranges = windows(ids.len());
         let keys: Vec<Arc<[u32]>> = ranges
