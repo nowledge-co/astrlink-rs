@@ -1,0 +1,20 @@
+{
+  "repository": "QuantumNous/astrlink-guard",
+  "revision": "7216b6a3b897ef903d4b1ba367ae6fb95b0fa5e4",
+  "directory": "int8",
+  "model": {
+    "file": "model_int8.onnx",
+    "size": 330781,
+    "sha256": "0a070d3113615e33ba3b84d6bd486f663a377c04c4b056e7381732179f51832a"
+  },
+  "data": {
+    "file": "model_int8.onnx_data",
+    "size": 37124608,
+    "sha256": "0ba34216ceead01e0ae2dfd8e46d52b67e7aee80b04f722d9b758613a91c0067"
+  },
+  "tokenizer": {
+    "file": "tokenizer.json",
+    "size": 1502881,
+    "sha256": "0cf3b235ef125658015a6c8026a5fe6f28088bf825101a990ec18a10200feef4"
+  }
+}

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bazel:
+    name: Bazel build, model tests and Clippy
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Optional public HTTPS cache. No credentials or uploads are used.
+      BAZEL_REMOTE_CACHE_URL: ${{ vars.BAZEL_REMOTE_CACHE_URL }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: bazelbuild/setup-bazelisk@6ecf4fd8b7d1f9721785f1dd656a689acf9add47 # v3
+        with:
+          bazelisk-version: 1.28.1
+      - name: Restore build caches
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ${{ runner.temp }}/bazelisk
+            ${{ runner.temp }}/bazel-cache/repository
+            ${{ runner.temp }}/bazel-cache/disk
+          key: bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'Cargo.lock') }}-
+      - name: Restore pinned model assets
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/astrlink-model
+          key: astrlink-model-${{ hashFiles('model.json') }}
+      - name: Download and verify pinned model assets
+        env:
+          ASTRLINK_MODEL_DIR: ${{ runner.temp }}/astrlink-model
+        run: python3 -I tools/download.py "$ASTRLINK_MODEL_DIR"
+      - name: Build and run native tests and Clippy
+        shell: bash
+        env:
+          BAZELISK_HOME: ${{ runner.temp }}/bazelisk
+          ASTRLINK_MODEL_DIR: ${{ runner.temp }}/astrlink-model
+          # Bazel 9 rejects a repository cache placed inside the main repository.
+          BAZEL_CACHE_ROOT: ${{ runner.temp }}/bazel-cache
+        run: |
+          set -euo pipefail
+          options=(
+            --compilation_mode=opt
+            --repository_cache="$BAZEL_CACHE_ROOT/repository"
+            --disk_cache="$BAZEL_CACHE_ROOT/disk"
+            --lockfile_mode=off
+          )
+          if [[ -n "$BAZEL_REMOTE_CACHE_URL" ]]; then
+            if [[ "$BAZEL_REMOTE_CACHE_URL" != https://* ]]; then
+              echo '::error::BAZEL_REMOTE_CACHE_URL must be a public HTTPS cache URL.'
+              exit 1
+            fi
+            options+=(--remote_cache="$BAZEL_REMOTE_CACHE_URL" --remote_upload_local_results=false)
+          else
+            echo '::notice::Remote cache infrastructure is not configured; running correctness checks with local disk and repository caches.'
+            echo 'Remote cache infrastructure is not configured. Disk and repository caches are active; they do not constitute remote-cache qualification.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          bazel --batch --ignore_all_rc_files build "${options[@]}" //:astrlink
+          bazel --batch --ignore_all_rc_files test "${options[@]}" \
+            //:astrlink_test //:clippy \
+            --test_arg=--include-ignored --test_arg=--nocapture --test_output=all
