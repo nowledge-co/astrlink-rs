@@ -4,10 +4,16 @@
 //! (<https://github.com/yetone/magpie>), distributed under the MIT license.
 //! Erf and softmax arithmetic also adapt ONNX Runtime MLAS (Microsoft, MIT).
 //! Integer products widen before multiplication; all inference buffers belong
-//! to the call. Window-level scheduling is the caller's responsibility.
+//! to the call. A split window runs matrix rows, attention heads and GELU rows
+//! as tasks on the caller's rayon pool, as Magpie splits a window's work over
+//! free cores; an unsplit window runs them in order on the calling thread. Each
+//! output value keeps one serial operation order, so results do not depend on
+//! the split, the worker count or how work is stolen.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use rayon::prelude::*;
 
 use crate::Error;
 use crate::onnx::Tensor;
@@ -173,7 +179,18 @@ impl Net {
     }
 
     /// Returns row-major [ids.len(), 21] logits for one unpadded window.
-    pub(crate) fn logits(&self, ids: &[u32], cancelled: &AtomicBool) -> Result<Vec<f32>, Error> {
+    ///
+    /// With `split`, call this inside the model's pool: nested parallel work
+    /// otherwise runs on rayon's global pool and escapes the model's worker
+    /// budget. Only a window that holds every worker may split. A worker that
+    /// waits for split work runs other queued jobs meanwhile, so a split window
+    /// beside other windows could resume only after a whole other window.
+    pub(crate) fn logits(
+        &self,
+        ids: &[u32],
+        cancelled: &AtomicBool,
+        split: bool,
+    ) -> Result<Vec<f32>, Error> {
         check_cancelled(cancelled)?;
         if ids.len() > MAX_POSITIONS {
             return Err(Error::Model("a network window exceeds 512 tokens".into()));
@@ -203,28 +220,33 @@ impl Net {
         for layer in &self.layers {
             check_cancelled(cancelled)?;
             let mut attended = {
-                let mut qkv = layer.qkv.matmul(&x)?;
+                let mut qkv = layer.qkv.matmul(&x, split)?;
                 add_bias(&mut qkv, &layer.qkv_bias);
-                let context = attention(&qkv, rows);
-                layer.attention_out.matmul(&context)?
+                let context = attention(&qkv, rows, split);
+                layer.attention_out.matmul(&context, split)?
             };
             layer
                 .attention_norm
                 .skip(&mut attended, &x, &layer.attention_bias);
-            let mut hidden = layer.up.matmul(&attended)?;
-            for row in hidden.chunks_exact_mut(INTERMEDIATE) {
+            let mut hidden = layer.up.matmul(&attended, split)?;
+            let activate = |row: &mut [f32]| {
                 for (c, value) in row.iter_mut().enumerate() {
                     *value = gelu(*value + layer.up_bias[c]) * layer.smooth[c];
                 }
+            };
+            if split {
+                hidden.par_chunks_mut(INTERMEDIATE).for_each(activate);
+            } else {
+                hidden.chunks_mut(INTERMEDIATE).for_each(activate);
             }
-            let mut out = layer.down.matmul(&hidden)?;
+            let mut out = layer.down.matmul(&hidden, split)?;
             layer
                 .output_norm
                 .skip(&mut out, &attended, &layer.down_bias);
             x = out;
         }
         check_cancelled(cancelled)?;
-        let mut out = self.classifier.matmul(&x)?;
+        let mut out = self.classifier.matmul(&x, split)?;
         add_bias(&mut out, &self.classifier_bias);
         ensure_finite(&out, "classifier output")?;
         check_cancelled(cancelled)?;
@@ -378,14 +400,14 @@ impl QuantizedMatrix {
         })
     }
 
-    fn matmul(&self, x: &[f32]) -> Result<Vec<f32>, Error> {
+    // Magpie splits output columns over free cores; rows are split here
+    // instead. Either split computes every value with the same serial
+    // arithmetic, so the result is identical.
+    fn matmul(&self, x: &[f32], split: bool) -> Result<Vec<f32>, Error> {
         let (quantized, scale, zero_point) = quantize(x)?;
         let rows = x.len() / self.input;
         let mut out = vec![0.0; rows * self.output];
-        for (row, result) in quantized
-            .chunks_exact(self.input)
-            .zip(out.chunks_exact_mut(self.output))
-        {
+        let multiply = |(row, result): (&[u8], &mut [f32])| {
             let sum: i32 = row.iter().map(|&v| i32::from(v)).sum();
             for (c, column) in self.weights.chunks_exact(self.input).enumerate() {
                 let weight_zp = self.zero_points[c];
@@ -396,6 +418,17 @@ impl QuantizedMatrix {
                     + self.input as i32 * zero_point * weight_zp;
                 result[c] = value as f32 * (scale * self.scales[c]);
             }
+        };
+        if split {
+            quantized
+                .par_chunks_exact(self.input)
+                .zip(out.par_chunks_exact_mut(self.output))
+                .for_each(multiply);
+        } else {
+            quantized
+                .chunks_exact(self.input)
+                .zip(out.chunks_exact_mut(self.output))
+                .for_each(multiply);
         }
         Ok(out)
     }
@@ -446,6 +479,9 @@ impl LayerNorm {
             // The exported CPU LayerNormalization and SkipLayerNormalization
             // use E[x²] - E[x]² and divide by the f32 standard deviation.
             // Reassociating these operations can change subsequent INT8 bins.
+            // Magpie's Go code uses a two-pass variance and an f64 square
+            // root; this port follows the ONNX Runtime kernel, which the
+            // oracle fixtures qualify.
             let mean_square = row.iter().map(|v| v * v).sum::<f32>() / HIDDEN as f32;
             let deviation = (mean_square - mean * mean + 1e-12).sqrt();
             for (c, value) in row.iter_mut().enumerate() {
@@ -474,59 +510,81 @@ fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + mlas_erf(x * std::f32::consts::FRAC_1_SQRT_2))
 }
 
-fn attention(qkv: &[f32], tokens: usize) -> Vec<f32> {
+fn attention(qkv: &[f32], tokens: usize, split: bool) -> Vec<f32> {
     let scale = (1.0 / (HEAD_DIM as f64).sqrt()) as f32;
+    // Heads are independent; each keeps the serial order in `attend`.
+    let head = |head| attend(qkv, tokens, head, scale);
+    let heads: Vec<Vec<f32>> = if split {
+        (0..HEADS).into_par_iter().map(head).collect()
+    } else {
+        (0..HEADS).map(head).collect()
+    };
     let mut context = vec![0.0; tokens * HIDDEN];
-    // Transposed keys let the score loop traverse contiguous data. Heads are
-    // evaluated serially; the caller can run independent windows in its pool.
+    for (head, values) in heads.iter().enumerate() {
+        for (out, row) in context
+            .chunks_exact_mut(HIDDEN)
+            .zip(values.chunks_exact(HEAD_DIM))
+        {
+            out[head * HEAD_DIM..(head + 1) * HEAD_DIM].copy_from_slice(row);
+        }
+    }
+    context
+}
+
+// Magpie's Go code scales each query before its dot products, sums the softmax
+// serially with Cephes expf and accumulates without fused operations. This
+// follows the ONNX Runtime QAttention CPU kernel instead (fused dot products,
+// scaling afterwards, MLAS exp and its 16-lane sum), which the oracle fixtures
+// qualify. docs/upstream.md records the measured comparison.
+fn attend(qkv: &[f32], tokens: usize, head: usize, scale: f32) -> Vec<f32> {
+    // Transposed keys let the score loop traverse contiguous data.
     let mut keys = vec![0.0; HEAD_DIM * tokens];
     let mut values = vec![0.0; tokens * HEAD_DIM];
-    let mut probabilities = vec![0.0; tokens];
-    for head in 0..HEADS {
-        for (token, row) in qkv.chunks_exact(3 * HIDDEN).enumerate() {
-            for c in 0..HEAD_DIM {
-                keys[c * tokens + token] = row[HIDDEN + head * HEAD_DIM + c];
-            }
-            values[token * HEAD_DIM..(token + 1) * HEAD_DIM].copy_from_slice(
-                &row[2 * HIDDEN + head * HEAD_DIM..2 * HIDDEN + (head + 1) * HEAD_DIM],
-            );
+    for (token, row) in qkv.chunks_exact(3 * HIDDEN).enumerate() {
+        for c in 0..HEAD_DIM {
+            keys[c * tokens + token] = row[HIDDEN + head * HEAD_DIM + c];
         }
-        for (token, row) in qkv.chunks_exact(3 * HIDDEN).enumerate() {
-            probabilities.fill(0.0);
-            let query = &row[head * HEAD_DIM..(head + 1) * HEAD_DIM];
-            for (&q, key_row) in query.iter().zip(keys.chunks_exact(tokens)) {
-                for (score, &k) in probabilities.iter_mut().zip(key_row) {
-                    *score = q.mul_add(k, *score);
-                }
+        values[token * HEAD_DIM..(token + 1) * HEAD_DIM].copy_from_slice(
+            &row[2 * HIDDEN + head * HEAD_DIM..2 * HIDDEN + (head + 1) * HEAD_DIM],
+        );
+    }
+    let mut context = vec![0.0; tokens * HEAD_DIM];
+    let mut probabilities = vec![0.0; tokens];
+    for (row, out) in qkv
+        .chunks_exact(3 * HIDDEN)
+        .zip(context.chunks_exact_mut(HEAD_DIM))
+    {
+        probabilities.fill(0.0);
+        let query = &row[head * HEAD_DIM..(head + 1) * HEAD_DIM];
+        for (&q, key_row) in query.iter().zip(keys.chunks_exact(tokens)) {
+            for (score, &k) in probabilities.iter_mut().zip(key_row) {
+                *score = q.mul_add(k, *score);
             }
-            for score in &mut probabilities {
-                *score *= scale;
-            }
-            let max = probabilities
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
-            // Preserve the reference's 16-lane reduction order without SIMD
-            // intrinsics. Serial summation can change the next quantized bin.
-            let mut sums = [0.0_f32; 16];
-            for (i, score) in probabilities.iter_mut().enumerate() {
-                *score = mlas_exp(*score - max);
-                sums[i % 16] += *score;
-            }
-            for i in 0..8 {
-                sums[i] += sums[i + 8];
-            }
-            let sum = ((sums[0] + sums[1]) + (sums[2] + sums[3]))
-                + ((sums[4] + sums[5]) + (sums[6] + sums[7]));
-            let inverse = 1.0 / sum;
-            let out = &mut context
-                [token * HIDDEN + head * HEAD_DIM..token * HIDDEN + (head + 1) * HEAD_DIM];
-            for (&probability, value_row) in probabilities.iter().zip(values.chunks_exact(HEAD_DIM))
-            {
-                let probability = probability * inverse;
-                for (value, &v) in out.iter_mut().zip(value_row) {
-                    *value = probability.mul_add(v, *value);
-                }
+        }
+        for score in &mut probabilities {
+            *score *= scale;
+        }
+        let max = probabilities
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        // Preserve the reference's 16-lane reduction order without SIMD
+        // intrinsics. Serial summation can change the next quantized bin.
+        let mut sums = [0.0_f32; 16];
+        for (i, score) in probabilities.iter_mut().enumerate() {
+            *score = mlas_exp(*score - max);
+            sums[i % 16] += *score;
+        }
+        for i in 0..8 {
+            sums[i] += sums[i + 8];
+        }
+        let sum = ((sums[0] + sums[1]) + (sums[2] + sums[3]))
+            + ((sums[4] + sums[5]) + (sums[6] + sums[7]));
+        let inverse = 1.0 / sum;
+        for (&probability, value_row) in probabilities.iter().zip(values.chunks_exact(HEAD_DIM)) {
+            let probability = probability * inverse;
+            for (value, &v) in out.iter_mut().zip(value_row) {
+                *value = probability.mul_add(v, *value);
             }
         }
     }
@@ -537,6 +595,10 @@ fn attention(qkv: &[f32], tokens: usize) -> Vec<f32> {
 // An accurate but differently rounded erf can cross an INT8 bin boundary:
 // x=-2.742307 produces different bins after GELU and SmoothQuant with libm erf.
 // Keep fused operations explicit so this arithmetic is portable safe Rust.
+// Magpie's Go GELU uses Abramowitz-Stegun 7.1.26 with Cephes expf instead.
+// That approximation is accurate, but its rounding differs from ONNX Runtime's
+// BiasGelu kernel. The port retains MLAS rounding to reproduce the publisher's
+// runtime; see docs/upstream.md for the measured comparison.
 fn mlas_erf(x: f32) -> f32 {
     let a = x.abs().min(3.925);
     let r = if a <= 0.921875 {

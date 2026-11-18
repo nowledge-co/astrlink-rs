@@ -35,6 +35,100 @@ fn user_gets_complete_bounded_window_coverage() {
     }
 }
 
+fn wait_until(condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition not reached"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// Order in which waiting scans `(name, windows left)` get the one turn,
+/// arriving in the given order after a running window took it.
+fn turn_order(waiting: &[(&'static str, usize)]) -> Vec<&'static str> {
+    let turns = turns::Turns::new(1);
+    let running = turns.take(1, turns.arrive(), || false).unwrap();
+    let order = std::sync::Mutex::new(Vec::new());
+    let arrivals: Vec<u64> = waiting.iter().map(|_| turns.arrive()).collect();
+    std::thread::scope(|scope| {
+        // Threads start in reverse, so arrival rather than start order counts.
+        for (&(name, left), &arrival) in waiting.iter().zip(&arrivals).rev() {
+            let (turns, order) = (&turns, &order);
+            scope.spawn(move || {
+                let _turn = turns.take(left, arrival, || false).unwrap();
+                order.lock().unwrap().push(name);
+            });
+        }
+        wait_until(|| turns.snapshot() == (0, waiting.len()));
+        drop(running);
+    });
+    order.into_inner().unwrap()
+}
+
+#[test]
+fn user_gets_the_next_worker_turn_for_the_scan_with_fewest_windows_left() {
+    // Given scans waiting for a busy worker, when its window ends, then the scan
+    // with the fewest windows left goes next, and equal ones go in arrival order.
+    assert_eq!(
+        turn_order(&[("long", 5), ("short", 1), ("medium", 2)]),
+        ["short", "medium", "long"]
+    );
+    assert_eq!(
+        turn_order(&[("first", 2), ("second", 2)]),
+        ["first", "second"]
+    );
+}
+
+#[test]
+fn user_gets_a_cancelled_wait_without_holding_a_worker_turn() {
+    // Given a scan waiting for the only turn,
+    let turns = turns::Turns::new(1);
+    let running = turns.take(1, turns.arrive(), || false).unwrap();
+    let cancel = Cancellation::default();
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| {
+            turns
+                .take(1, turns.arrive(), || cancel.check().is_err())
+                .is_none()
+        });
+        wait_until(|| turns.snapshot() == (0, 1));
+        // when it is cancelled, then it leaves the queue without a turn,
+        cancel.cancel();
+        assert!(waiting.join().unwrap());
+    });
+    assert_eq!(turns.snapshot(), (0, 0));
+    // and the running window's turn still returns.
+    drop(running);
+    assert_eq!(turns.snapshot(), (1, 0));
+}
+
+#[test]
+fn user_gets_every_worker_for_a_lone_window_and_one_otherwise() {
+    let turns = turns::Turns::new(3);
+    // Given an idle model, when a scan's only window starts, then it splits
+    // over every worker until it ends.
+    let lone = turns.take(1, turns.arrive(), || false).unwrap();
+    assert!(lone.split());
+    assert_eq!(turns.snapshot(), (0, 0));
+    drop(lone);
+    assert_eq!(turns.snapshot(), (3, 0));
+    // Given an idle model, when a scan with several windows starts one, then
+    // that window takes one worker and leaves the rest to its other windows,
+    let first = turns.take(2, turns.arrive(), || false).unwrap();
+    assert!(!first.split());
+    assert_eq!(turns.snapshot(), (2, 0));
+    // and a later single window beside it takes one worker too.
+    let beside = turns.take(1, turns.arrive(), || false).unwrap();
+    assert!(!beside.split());
+    assert_eq!(turns.snapshot(), (1, 0));
+    // A model with one worker never splits.
+    let single = turns::Turns::new(1);
+    assert!(!single.take(1, single.arrive(), || false).unwrap().split());
+}
+
 #[test]
 fn user_gets_original_cause_in_tokenizer_error_chain() {
     use std::error::Error as _;
@@ -439,8 +533,9 @@ fn model(workers: usize) -> Model {
 #[test]
 #[ignore = "requires pinned assets; run explicitly with ASTRLINK_MODEL_DIR"]
 fn user_gets_predictions_qualified_against_independent_onnx_runtime() {
-    // Given synthetic ORT fixtures, when executing Rust, then offsets and logits agree.
-    let model = model(1);
+    // Given synthetic ORT fixtures, when executing Rust, then offsets and logits
+    // agree, whether a window splits over workers or not.
+    let model = model(3);
     let oracle: Oracle = serde_json::from_str(include_str!("../testdata/oracle.json")).unwrap();
     assert!(
         !oracle.cases.is_empty(),
@@ -468,7 +563,23 @@ fn user_gets_predictions_qualified_against_independent_onnx_runtime() {
             .chain(case.ids)
             .chain(std::iter::once(2))
             .collect();
-        let actual = model.0.net.logits(&ids, &AtomicBool::new(false)).unwrap();
+        let actual = model
+            .0
+            .pool
+            .install(|| model.0.net.logits(&ids, &AtomicBool::new(false), true))
+            .unwrap();
+        let unsplit = model
+            .0
+            .net
+            .logits(&ids, &AtomicBool::new(false), false)
+            .unwrap();
+        assert!(
+            actual
+                .iter()
+                .zip(&unsplit)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "a split window must compute the same bits"
+        );
         assert_eq!(actual.len(), case.logits.len() * 21);
         for (actual, expected) in actual.chunks_exact(21).zip(&case.logits) {
             assert_eq!(expected.len(), 21);
@@ -646,6 +757,34 @@ fn user_gets_busy_and_input_limits_without_losing_admission() {
         })
     ));
     assert!(session.scan("", 0.8, &Cancellation::default()).is_ok());
+}
+
+#[test]
+#[ignore = "requires pinned assets; run explicitly with ASTRLINK_MODEL_DIR"]
+fn user_gets_a_short_scan_before_the_rest_of_a_long_one() {
+    // Given every worker computing a window of a long scan,
+    let model = model(3);
+    let long_text = "Alice wrote to alice@example.org about the meeting. ".repeat(150);
+    let mut long_session = model.session(0).unwrap();
+    std::thread::scope(|scope| {
+        let long =
+            scope.spawn(move || long_session.scan(&long_text, 0.8, &Cancellation::default()));
+        wait_until(|| model.0.turns.snapshot().0 == 0 || long.is_finished());
+        // when a one-window scan arrives,
+        let short = model
+            .session(0)
+            .unwrap()
+            .scan("Contact alice@example.com.", 0.8, &Cancellation::default())
+            .unwrap();
+        // then it completes while the long scan still has windows to compute.
+        assert!(
+            !long.is_finished(),
+            "the short scan waited for the whole long scan"
+        );
+        assert!(short.spans.iter().any(|s| s.category == Category::Email));
+        let long = long.join().unwrap().unwrap();
+        assert!(long.computed_windows >= 3);
+    });
 }
 
 #[test]

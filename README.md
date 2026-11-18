@@ -33,6 +33,17 @@ Keep one session per data owner. Sessions share model weights and compute thread
 
 The library performs synchronous CPU work. Use a bounded blocking executor from an async application. Excess requests return `Error::Busy`. Observed cancellation returns `Error::Cancelled` after active workers settle; cancellation racing with completion may return success. See [`Cancellation`](src/lib.rs) for the contract.
 
+On x86_64, build with `-C target-feature=+fma` or `-C target-cpu=x86-64-v3` when every deployment CPU supports it. Without fused multiply-add instructions, inference is about seven times slower; results are identical. See [upstream alignment](docs/upstream.md#performance).
+
+Cargo's dev profile builds dependencies without optimization. An application that runs inference in debug builds should optimize this crate in its own `Cargo.toml`:
+
+```toml
+[profile.dev.package.astrlink]
+opt-level = 3
+overflow-checks = false
+debug-assertions = false
+```
+
 ## Example
 
 ```sh
@@ -45,6 +56,7 @@ The example prints byte offsets, category and confidence as TSV. It does not pri
 
 - [Model assets and licenses](docs/model.md)
 - [Architecture and concurrency contract](docs/architecture.md)
+- [Upstream alignment and evidence](docs/upstream.md)
 - [Development and validation](docs/development.md)
 
 ## License and attribution
