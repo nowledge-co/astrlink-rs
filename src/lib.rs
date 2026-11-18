@@ -10,6 +10,7 @@ mod error;
 mod net;
 mod onnx;
 mod scan;
+mod turns;
 
 pub use error::Error;
 pub use scan::{Category, Scan, Session, Span};
@@ -44,7 +45,9 @@ impl Cancellation {
 /// Resource limits shared by all sessions of a model.
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// Number of compute threads, from 1 through 64 inclusive.
+    /// Number of compute threads, from 1 through 64 inclusive. At most this many
+    /// windows compute at once. The next one goes to the scan with the fewest
+    /// windows left.
     /// [`Model::load`] returns [`Error::Configuration`] outside this range.
     pub workers: usize,
     /// Maximum simultaneous scans, from 1 through 64 inclusive.
@@ -73,6 +76,7 @@ struct Inner {
     net: net::Net,
     tokenizer: tokenizers::Tokenizer,
     pool: rayon::ThreadPool,
+    turns: turns::Turns,
     options: Options,
     active: AtomicUsize,
 }
@@ -130,6 +134,7 @@ impl Model {
             net,
             tokenizer,
             pool,
+            turns: turns::Turns::new(options.workers),
             options,
             active: AtomicUsize::new(0),
         })))

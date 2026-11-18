@@ -1,10 +1,10 @@
 // Window selection and BIO decoding derive from Magpie (MIT, Copyright 2026 yetone).
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use rayon::prelude::*;
-
+use crate::turns::Turn;
 use crate::{Cancellation, Error, Model};
 
 const WINDOW: usize = 510;
@@ -181,26 +181,7 @@ impl Session {
             .map(|key| self.cache.get(key).cloned())
             .collect();
         let cached_windows = cached.iter().filter(|entry| entry.is_some()).count();
-        let predictions: Result<Vec<Predictions>, Error> = inner.pool.install(|| {
-            keys.par_iter()
-                .zip(&cached)
-                .map(|(key, hit)| {
-                    cancel.check()?;
-                    if let Some(hit) = hit {
-                        return Ok(Arc::clone(hit));
-                    }
-                    let logits = inner.net.logits(key, &cancel.0)?;
-                    let predictions = logits
-                        .chunks_exact(21)
-                        .skip(1)
-                        .take(key.len() - 2)
-                        .map(predict)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(Arc::from(predictions))
-                })
-                .collect()
-        });
-        let predictions = predictions?;
+        let predictions = compute(inner, &keys, cached, cancel)?;
         cancel.check()?;
         let selected = stitch(ids.len(), &ranges, &predictions);
         let spans = decode(offsets, &selected, threshold);
@@ -223,6 +204,99 @@ impl Session {
             computed_windows: ranges.len() - cached_windows,
         })
     }
+}
+
+// Uncached windows run on the model's pool, each with its own turn (see
+// `turns`): the scan with the fewest windows left gets the next free worker,
+// as Magpie gives its local model to the request with the least left to read.
+// A window splits over the pool only when its turn holds every worker. The
+// calling thread hands windows out and waits; it computes none itself. A
+// failed or cancelled window stops the hand-out, and windows already running
+// finish before this returns.
+fn compute(
+    inner: &crate::Inner,
+    keys: &[Arc<[u32]>],
+    cached: Vec<Option<Predictions>>,
+    cancel: &Cancellation,
+) -> Result<Vec<Predictions>, Error> {
+    let pending: Vec<usize> = (0..keys.len()).filter(|&i| cached[i].is_none()).collect();
+    let computed: Vec<OnceLock<Predictions>> = keys.iter().map(|_| OnceLock::new()).collect();
+    let failure: Mutex<Option<Error>> = Mutex::new(None);
+    let failed = AtomicBool::new(false);
+    let stop = || failed.load(Ordering::Relaxed) || cancel.check().is_err();
+    let arrival = inner.turns.arrive();
+    inner.pool.in_place_scope(|scope| {
+        for (started, &index) in pending.iter().enumerate() {
+            let Some(turn) = inner.turns.take(pending.len() - started, arrival, stop) else {
+                break;
+            };
+            let (key, slot, failure, failed) = (&keys[index], &computed[index], &failure, &failed);
+            let split = turn.split();
+            scope.spawn(move |_| {
+                let _running = Running {
+                    _turn: turn,
+                    failed,
+                };
+                match window(inner, key, cancel, split) {
+                    Ok(predictions) => {
+                        let _ = slot.set(predictions);
+                    }
+                    Err(error) => {
+                        failure
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .get_or_insert(error);
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    if let Some(error) = failure.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        return Err(error);
+    }
+    cancel.check()?;
+    cached
+        .into_iter()
+        .zip(computed)
+        .map(|(hit, slot)| {
+            hit.or_else(|| slot.into_inner())
+                .ok_or_else(|| Error::Model("a window was not computed".into()))
+        })
+        .collect()
+}
+
+/// A window's turn while it runs. A panicking window marks its scan failed
+/// before the turn returns, so the scan starts no further window; the scope
+/// then resumes the panic on the calling thread.
+struct Running<'a> {
+    _turn: Turn<'a>,
+    failed: &'a AtomicBool,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.failed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+fn window(
+    inner: &crate::Inner,
+    key: &[u32],
+    cancel: &Cancellation,
+    split: bool,
+) -> Result<Predictions, Error> {
+    cancel.check()?;
+    let logits = inner.net.logits(key, &cancel.0, split)?;
+    let predictions = logits
+        .chunks_exact(21)
+        .skip(1)
+        .take(key.len() - 2)
+        .map(predict)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::from(predictions))
 }
 
 // Magpie's Find starts windows at the same token positions: 510 content tokens

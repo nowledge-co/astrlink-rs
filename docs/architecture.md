@@ -6,7 +6,7 @@ The crate executes one hash-pinned INT8 BERT graph. It is not a general ONNX exe
 
 The tokenizer loads the publisher's tokenizer JSON without truncation or padding. The scanner adds start and end tokens to each window. `scan.rs` owns the window length and overlap. Each window starts its position IDs at zero and has its own dynamic activation quantization range.
 
-The integer dot products use widened accumulation. GELU uses the erf definition. Weight packing changes memory layout without changing quantized values. The shared pool runs independent windows in parallel. Within a window, matrix rows, attention heads and GELU rows are pool tasks, so a lone window can use every worker while concurrent windows share them. Each output value keeps one serial operation order; the worker count does not change results.
+The integer dot products use widened accumulation. GELU uses the erf definition. Weight packing changes memory layout without changing quantized values. The shared pool runs independent windows in parallel. Each uncached window first takes one of the model's worker turns, and a model has one turn per worker. Of the admitted scans waiting, the scan with the fewest windows left takes the next turn, and equal scans go in arrival order. A short scan therefore waits for one running window to end, not for the rest of a long scan. A window holds one turn and runs on one worker, with one exception: a scan's last window takes every turn if all are free and no other scan waits. That window splits its matrix rows, attention heads and GELU rows over the pool, so a lone short scan uses every worker. A split window must hold every turn. A rayon worker waiting for split work runs other queued jobs meanwhile, so a split window beside other windows could stall until a whole other window ends. Each output value keeps one serial operation order; the split and the worker count do not change results.
 
 For each overlap token, the scanner chooses the prediction farthest from a window edge. Ties use the earlier window. BIO decoding runs over the complete selected token sequence. An unmatched I tag starts a span. Zero-width tokens do not start or end spans. A span score is the minimum selected token probability.
 
@@ -21,10 +21,10 @@ A scan follows these states:
 | Requested | Admitted, Busy, Cancelled, invalid configuration | Calling thread |
 | Admitted | Tokenized, input error, Cancelled | RAII permit |
 | Tokenized | Computing, input error, Cancelled | Calling thread |
-| Computing | Selected, inference error, Cancelled | Shared pool; caller waits |
+| Computing | Selected, inference error, Cancelled | Shared pool; caller hands out windows by turn and waits |
 | Selected | Complete | Calling thread |
 
-The permit remains held until workers settle and the call returns. No task detaches. Admission has no waiter queue. `Options` limits input bytes before tokenization and tokens after tokenization. Cache capacity limits both keys and predictions because every entry has a fixed maximum window length. FIFO eviction avoids a second recency policy.
+The permit remains held until workers settle and the call returns. No task detaches. Admission has no waiter queue. Only admitted scans wait for worker turns, so at most `max_in_flight` scans wait. A waiting scan observes cancellation within 20 ms. A steady stream of shorter scans can delay a longer one, as in Magpie. `Options` limits input bytes before tokenization and tokens after tokenization. Cache capacity limits both keys and predictions because every entry has a fixed maximum window length. FIFO eviction avoids a second recency policy.
 
 Successful scans cover every content token. Errors contain no partial `Scan`. Cancellation is cooperative; a running tokenizer operation or model layer finishes before the next check. Cache updates occur only after complete inference and a final cancellation check. A cancellation that races with completion can arrive after that check.
 

@@ -15,6 +15,8 @@ Reviewed revision: [yetone/magpie@dc507aefd](https://github.com/yetone/magpie/co
 | `8a64f5256`, `ac0b5c287` | Outer text pieces and request scheduling in `internal/pii`. | Application concerns. |
 | Others under `internal/pii` | pf-serve, downloads, platform detection, GUI paths. | Other backends or application concerns. |
 
+The review also found an engine behavior that predates the port and that the port lacked. Since `43a9d0440` (2026-10-29), the waiting request with the least left to read takes Magpie's model next. The port put all of a scan's windows on its pool at once, and rayon starts work injected from outside the pool only after it finishes the work it holds. An admitted short scan therefore waited for every window of a long scan: an end-to-end test measured 267 s behind an 85-window scan. Each window now takes a worker turn first; see Waiting below. On an Intel Xeon E5-2690 v4 with three workers, a 44-byte scan started during an 11-window scan took 9.6 to 10.0 s before and 2.7 to 2.9 s after. That is the time for one running window to end on one core; alone, the scan takes 33 ms.
+
 ## Deliberate differences
 
 | Area | Magpie | Port | Reason |
@@ -24,8 +26,8 @@ Reviewed revision: [yetone/magpie@dc507aefd](https://github.com/yetone/magpie/co
 | Score type | `float64`, stored and compared as `float32` | `f32` | Same value that Magpie stores. |
 | Span end | End of the last token | Largest token end | Same result for non-decreasing tokenizer offsets; the maximum preserves the slicing guarantee. |
 | Tokenizer | Go reimplementation tested against Hugging Face | Hugging Face `tokenizers` | Uses the reference implementation directly. |
-| Waiting | Requests wait for shared cores | `Error::Busy` beyond `max_in_flight` | No hidden queue; the application chooses waiting and order. |
-| Window work split | Output columns over free cores | Matrix rows, heads and GELU rows as pool tasks | Same values; rayon work stealing gives a lone window every worker. |
+| Waiting | Every request waits for the model's turn. The request with the least left to read goes next, and it yields the turn between chunks. | `Error::Busy` beyond `max_in_flight`. An admitted scan waits for a worker turn for each window. The scan with the fewest windows left goes next; equal scans go in arrival order. | Same turn order, counted in windows. Admission stays bounded, so the queue holds at most `max_in_flight` scans and the application decides whether to retry `Busy`. |
+| Window work split | A window takes one core and splits its output columns over the cores free then, up to its share | A window takes one worker. A scan's last window takes every worker when all are free and no other scan waits, and splits matrix rows, heads and GELU rows over them. | Same values. A rayon worker waiting for split work runs other queued windows meanwhile, so the port splits a window only when nothing else can be queued. A lone short text still uses every worker; a multi-window scan uses one worker a window, as in Magpie when windows fill its cores. |
 | CoreML, outer pieces, cross-text cache, value propagation, masking | Present | Absent | Separate backend or application concerns. See [architecture](architecture.md#port-boundary). |
 | Cancellation | None inside `guard` | Cooperative, between layers and windows | Extension for bounded callers. |
 

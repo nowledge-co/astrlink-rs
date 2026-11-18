@@ -4,10 +4,11 @@
 //! (<https://github.com/yetone/magpie>), distributed under the MIT license.
 //! Erf and softmax arithmetic also adapt ONNX Runtime MLAS (Microsoft, MIT).
 //! Integer products widen before multiplication; all inference buffers belong
-//! to the call. Matrix rows, attention heads and GELU rows run as tasks on the
-//! caller's rayon pool, as Magpie splits a window's work over free cores. Each
+//! to the call. A split window runs matrix rows, attention heads and GELU rows
+//! as tasks on the caller's rayon pool, as Magpie splits a window's work over
+//! free cores; an unsplit window runs them in order on the calling thread. Each
 //! output value keeps one serial operation order, so results do not depend on
-//! the worker count or on how work is stolen.
+//! the split, the worker count or how work is stolen.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,9 +180,17 @@ impl Net {
 
     /// Returns row-major [ids.len(), 21] logits for one unpadded window.
     ///
-    /// Call this inside the model's pool: nested parallel work otherwise runs
-    /// on rayon's global pool and escapes the model's worker budget.
-    pub(crate) fn logits(&self, ids: &[u32], cancelled: &AtomicBool) -> Result<Vec<f32>, Error> {
+    /// With `split`, call this inside the model's pool: nested parallel work
+    /// otherwise runs on rayon's global pool and escapes the model's worker
+    /// budget. Only a window that holds every worker may split. A worker that
+    /// waits for split work runs other queued jobs meanwhile, so a split window
+    /// beside other windows could resume only after a whole other window.
+    pub(crate) fn logits(
+        &self,
+        ids: &[u32],
+        cancelled: &AtomicBool,
+        split: bool,
+    ) -> Result<Vec<f32>, Error> {
         check_cancelled(cancelled)?;
         if ids.len() > MAX_POSITIONS {
             return Err(Error::Model("a network window exceeds 512 tokens".into()));
@@ -211,28 +220,33 @@ impl Net {
         for layer in &self.layers {
             check_cancelled(cancelled)?;
             let mut attended = {
-                let mut qkv = layer.qkv.matmul(&x)?;
+                let mut qkv = layer.qkv.matmul(&x, split)?;
                 add_bias(&mut qkv, &layer.qkv_bias);
-                let context = attention(&qkv, rows);
-                layer.attention_out.matmul(&context)?
+                let context = attention(&qkv, rows, split);
+                layer.attention_out.matmul(&context, split)?
             };
             layer
                 .attention_norm
                 .skip(&mut attended, &x, &layer.attention_bias);
-            let mut hidden = layer.up.matmul(&attended)?;
-            hidden.par_chunks_mut(INTERMEDIATE).for_each(|row| {
+            let mut hidden = layer.up.matmul(&attended, split)?;
+            let activate = |row: &mut [f32]| {
                 for (c, value) in row.iter_mut().enumerate() {
                     *value = gelu(*value + layer.up_bias[c]) * layer.smooth[c];
                 }
-            });
-            let mut out = layer.down.matmul(&hidden)?;
+            };
+            if split {
+                hidden.par_chunks_mut(INTERMEDIATE).for_each(activate);
+            } else {
+                hidden.chunks_mut(INTERMEDIATE).for_each(activate);
+            }
+            let mut out = layer.down.matmul(&hidden, split)?;
             layer
                 .output_norm
                 .skip(&mut out, &attended, &layer.down_bias);
             x = out;
         }
         check_cancelled(cancelled)?;
-        let mut out = self.classifier.matmul(&x)?;
+        let mut out = self.classifier.matmul(&x, split)?;
         add_bias(&mut out, &self.classifier_bias);
         ensure_finite(&out, "classifier output")?;
         check_cancelled(cancelled)?;
@@ -389,25 +403,33 @@ impl QuantizedMatrix {
     // Magpie splits output columns over free cores; rows are split here
     // instead. Either split computes every value with the same serial
     // arithmetic, so the result is identical.
-    fn matmul(&self, x: &[f32]) -> Result<Vec<f32>, Error> {
+    fn matmul(&self, x: &[f32], split: bool) -> Result<Vec<f32>, Error> {
         let (quantized, scale, zero_point) = quantize(x)?;
         let rows = x.len() / self.input;
         let mut out = vec![0.0; rows * self.output];
-        quantized
-            .par_chunks_exact(self.input)
-            .zip(out.par_chunks_exact_mut(self.output))
-            .for_each(|(row, result)| {
-                let sum: i32 = row.iter().map(|&v| i32::from(v)).sum();
-                for (c, column) in self.weights.chunks_exact(self.input).enumerate() {
-                    let weight_zp = self.zero_points[c];
-                    // Expanding Σ(q - xz)(w - wz) keeps the inner product simple.
-                    // The largest input width is 1536: even 1536 * 255 * 255
-                    // and every intermediate correction fit comfortably in i32.
-                    let value = dot(row, column) - weight_zp * sum - zero_point * self.sums[c]
-                        + self.input as i32 * zero_point * weight_zp;
-                    result[c] = value as f32 * (scale * self.scales[c]);
-                }
-            });
+        let multiply = |(row, result): (&[u8], &mut [f32])| {
+            let sum: i32 = row.iter().map(|&v| i32::from(v)).sum();
+            for (c, column) in self.weights.chunks_exact(self.input).enumerate() {
+                let weight_zp = self.zero_points[c];
+                // Expanding Σ(q - xz)(w - wz) keeps the inner product simple.
+                // The largest input width is 1536: even 1536 * 255 * 255
+                // and every intermediate correction fit comfortably in i32.
+                let value = dot(row, column) - weight_zp * sum - zero_point * self.sums[c]
+                    + self.input as i32 * zero_point * weight_zp;
+                result[c] = value as f32 * (scale * self.scales[c]);
+            }
+        };
+        if split {
+            quantized
+                .par_chunks_exact(self.input)
+                .zip(out.par_chunks_exact_mut(self.output))
+                .for_each(multiply);
+        } else {
+            quantized
+                .chunks_exact(self.input)
+                .zip(out.chunks_exact_mut(self.output))
+                .for_each(multiply);
+        }
         Ok(out)
     }
 }
@@ -488,13 +510,15 @@ fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + mlas_erf(x * std::f32::consts::FRAC_1_SQRT_2))
 }
 
-fn attention(qkv: &[f32], tokens: usize) -> Vec<f32> {
+fn attention(qkv: &[f32], tokens: usize, split: bool) -> Vec<f32> {
     let scale = (1.0 / (HEAD_DIM as f64).sqrt()) as f32;
-    // Heads are independent tasks; each keeps the serial order in `attend`.
-    let heads: Vec<Vec<f32>> = (0..HEADS)
-        .into_par_iter()
-        .map(|head| attend(qkv, tokens, head, scale))
-        .collect();
+    // Heads are independent; each keeps the serial order in `attend`.
+    let head = |head| attend(qkv, tokens, head, scale);
+    let heads: Vec<Vec<f32>> = if split {
+        (0..HEADS).into_par_iter().map(head).collect()
+    } else {
+        (0..HEADS).map(head).collect()
+    };
     let mut context = vec![0.0; tokens * HIDDEN];
     for (head, values) in heads.iter().enumerate() {
         for (out, row) in context
