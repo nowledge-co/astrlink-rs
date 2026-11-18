@@ -21,6 +21,8 @@ ASTRLINK_MODEL_DIR="$PWD/models/astrlink" cargo test --locked --release -- --inc
 uv run --no-project --with onnxruntime==1.23.2 --with tokenizers==0.23.3 python -I tools/oracle.py models/astrlink testdata/oracle.json
 ```
 
+Do not generate fixtures on an x86_64 CPU without VNNI. There, ONNX Runtime's AVX2 u8s8 kernel saturates intermediate sums in int16 and returns different logits. [Upstream alignment](upstream.md#measured-comparison) describes the exact integer reference used instead.
+
 Use the native Bazel targets for pre-merge compilation, lint and tests. See `BUILD.bazel` for target names. Pass an absolute `ASTRLINK_MODEL_DIR` and `--test_arg=--include-ignored` to qualify model tests. The test carrier compiles once for both ordinary and model tests.
 
 Keep performance evidence on the issue or PR. Record input size in model tokens, worker count, cache state, profile, hardware, latency and memory. A CPU result does not qualify CoreML or another platform.

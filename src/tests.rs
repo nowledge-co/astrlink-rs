@@ -468,7 +468,11 @@ fn user_gets_predictions_qualified_against_independent_onnx_runtime() {
             .chain(case.ids)
             .chain(std::iter::once(2))
             .collect();
-        let actual = model.0.net.logits(&ids, &AtomicBool::new(false)).unwrap();
+        let actual = model
+            .0
+            .pool
+            .install(|| model.0.net.logits(&ids, &AtomicBool::new(false)))
+            .unwrap();
         assert_eq!(actual.len(), case.logits.len() * 21);
         for (actual, expected) in actual.chunks_exact(21).zip(&case.logits) {
             assert_eq!(expected.len(), 21);

@@ -114,6 +114,9 @@ impl Session {
     /// Observed cancellation waits for active workers and returns [`Error::Cancelled`].
     /// See [`Cancellation`] for the completion race contract.
     /// Windows from failed calls are not added to the cache.
+    ///
+    /// Magpie masks at the publisher's 0.8 by default and accepts settings from
+    /// 0.5. Thresholds below 0.5 return spans that Magpie never reports.
     pub fn scan(
         &mut self,
         text: &str,
@@ -222,6 +225,8 @@ impl Session {
     }
 }
 
+// Magpie's Find starts windows at the same token positions: 510 content tokens
+// per window and 128 tokens of overlap.
 pub(crate) fn windows(tokens: usize) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -236,6 +241,9 @@ pub(crate) fn windows(tokens: usize) -> Vec<Range<usize>> {
     ranges
 }
 
+// As in Magpie's Find, the first maximal logit wins, and the probability sums
+// exp(f64(logit - max)) in f64 after the f32 subtraction. Rounding it to f32
+// gives the value Magpie stores and compares (float64(float32(score))).
 fn predict(row: &[f32]) -> Result<Prediction, Error> {
     if row.iter().any(|value| !value.is_finite()) {
         return Err(Error::Model("non-finite logits".into()));
@@ -256,6 +264,8 @@ fn predict(row: &[f32]) -> Result<Prediction, Error> {
     })
 }
 
+// Magpie's margin rule: each token takes the prediction from the window it is
+// farthest inside, and a tie keeps the earlier window.
 pub(crate) fn stitch(
     tokens: usize,
     ranges: &[Range<usize>],
@@ -276,6 +286,11 @@ pub(crate) fn stitch(
     selected
 }
 
+// Magpie's BIO rules, with two deliberate differences. Magpie drops spans under
+// 0.5 (guard.Floor) here and applies the user's threshold later; this applies the
+// caller's threshold directly. A span end takes the largest token end, while
+// Magpie assigns the last one. Tokenizer offsets do not decrease, so both give
+// the same end; the maximum still keeps every span sliceable.
 pub(crate) fn decode(
     offsets: &[(usize, usize)],
     predictions: &[Prediction],

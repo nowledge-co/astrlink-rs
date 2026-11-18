@@ -6,7 +6,7 @@ The crate executes one hash-pinned INT8 BERT graph. It is not a general ONNX exe
 
 The tokenizer loads the publisher's tokenizer JSON without truncation or padding. The scanner adds start and end tokens to each window. `scan.rs` owns the window length and overlap. Each window starts its position IDs at zero and has its own dynamic activation quantization range.
 
-The integer dot products use widened accumulation. GELU uses the erf definition. Weight packing changes memory layout without changing quantized values. Kernel execution stays serial within a window; the shared pool runs independent windows in parallel.
+The integer dot products use widened accumulation. GELU uses the erf definition. Weight packing changes memory layout without changing quantized values. The shared pool runs independent windows in parallel. Within a window, matrix rows, attention heads and GELU rows are pool tasks, so a lone window can use every worker while concurrent windows share them. Each output value keeps one serial operation order; the worker count does not change results.
 
 For each overlap token, the scanner chooses the prediction farthest from a window edge. Ties use the earlier window. BIO decoding runs over the complete selected token sequence. An unmatched I tag starts a span. Zero-width tokens do not start or end spans. A span score is the minimum selected token probability.
 
@@ -32,6 +32,6 @@ The cache retains token IDs, which can reveal input. It has no disk format, glob
 
 ## Port boundary
 
-The port retains fixed model windows, quantized weights, overlap selection and shared CPU budgets from Magpie. It uses Hugging Face's Rust tokenizer and Rust resource ownership.
+The port retains fixed model windows, quantized weights, overlap selection and shared CPU budgets from Magpie. It uses Hugging Face's Rust tokenizer and Rust resource ownership. [Upstream alignment](upstream.md) records the reviewed Magpie revision, each deliberate difference and its evidence.
 
 Outer text chunks, cross-text batching, value propagation and masking policies are application concerns. Fixed token windows can lose cache hits after an early edit; an unchanged window always has the same result. CoreML requires a separate backend and macOS qualification. The portable CPU implementation does not qualify Apple acceleration or model accuracy for a product.
