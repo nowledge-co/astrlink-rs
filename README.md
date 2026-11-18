@@ -35,6 +35,15 @@ The library performs synchronous CPU work. Use a bounded blocking executor from 
 
 On x86_64, build with `-C target-feature=+fma` or `-C target-cpu=x86-64-v3` when every deployment CPU supports it. Without fused multiply-add instructions, inference is about seven times slower; results are identical. See [upstream alignment](docs/upstream.md#performance).
 
+Cargo's dev profile builds dependencies without optimization. An application that runs inference in debug builds should optimize this crate in its own `Cargo.toml`:
+
+```toml
+[profile.dev.package.astrlink]
+opt-level = 3
+overflow-checks = false
+debug-assertions = false
+```
+
 ## Example
 
 ```sh

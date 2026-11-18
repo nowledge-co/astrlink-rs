@@ -52,3 +52,5 @@ Full 510-token windows amplify last-bit differences through dynamic INT8 quantiz
 ## Performance
 
 Magpie selects SSE2 or AVX2 assembly when it starts. This crate forbids unsafe code and has no runtime CPU dispatch. On x86_64 without the `fma` target feature, each `f32::mul_add` becomes a library call. Build x86_64 applications with `-C target-feature=+fma` or `-C target-cpu=x86-64-v3` when every deployment CPU supports it. Results are identical with and without the feature. On six multi-window texts (43 KB, three workers, Intel Xeon E5-2690 v4), the feature reduced inference from 216 s to 32 s.
+
+A downstream application's dev build compiled this crate with `opt-level = 3`. Also turning off overflow checks and debug assertions for the crate made full windows 2.0 times faster (4.58 s to 2.26 s a window) and short texts 4.3 times faster (0.201 s to 0.046 s), with identical results on 51 texts. The README gives the profile settings.
